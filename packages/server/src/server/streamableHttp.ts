@@ -142,6 +142,15 @@ export interface WebStandardStreamableHTTPServerTransportOptions {
     retryInterval?: number;
 
     /**
+     * Interval in milliseconds for sending SSE keepalive comments on the standalone
+     * GET SSE stream. When set, the transport sends periodic SSE comments
+     * (`: keepalive`) to prevent reverse proxies from closing idle connections.
+     *
+     * Disabled by default (no keepalive comments are sent).
+     */
+    keepAliveInterval?: number;
+
+    /**
      * List of protocol versions that this transport will accept.
      * Used to validate the `mcp-protocol-version` header in incoming requests.
      *
@@ -238,6 +247,8 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
     private _allowedOrigins?: string[];
     private _enableDnsRebindingProtection: boolean;
     private _retryInterval?: number;
+    private _keepAliveInterval?: number;
+    private _keepAliveTimer?: ReturnType<typeof setInterval>;
     private _supportedProtocolVersions: string[];
 
     sessionId?: string;
@@ -255,6 +266,7 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         this._allowedOrigins = options.allowedOrigins;
         this._enableDnsRebindingProtection = options.enableDnsRebindingProtection ?? false;
         this._retryInterval = options.retryInterval;
+        this._keepAliveInterval = options.keepAliveInterval;
         this._supportedProtocolVersions = options.supportedProtocolVersions ?? SUPPORTED_PROTOCOL_VERSIONS;
     }
 
@@ -443,6 +455,7 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
             },
             cancel: () => {
                 // Stream was cancelled by client
+                this._clearKeepAliveTimer();
                 this._streamMapping.delete(this._standaloneSseStreamId);
             }
         });
@@ -471,6 +484,19 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
                 }
             }
         });
+
+        // Start keepalive timer to send periodic SSE comments that prevent
+        // reverse proxies from closing the connection due to idle timeouts
+        if (this._keepAliveInterval !== undefined) {
+            this._keepAliveTimer = setInterval(() => {
+                try {
+                    streamController!.enqueue(encoder.encode(': keepalive\n\n'));
+                } catch {
+                    // Controller is closed or errored, stop sending keepalives
+                    this._clearKeepAliveTimer();
+                }
+            }, this._keepAliveInterval);
+        }
 
         return new Response(readable, { headers });
     }
@@ -886,7 +912,16 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         return undefined;
     }
 
+    private _clearKeepAliveTimer(): void {
+        if (this._keepAliveTimer !== undefined) {
+            clearInterval(this._keepAliveTimer);
+            this._keepAliveTimer = undefined;
+        }
+    }
+
     async close(): Promise<void> {
+        this._clearKeepAliveTimer();
+
         // Close all SSE connections
         for (const { cleanup } of this._streamMapping.values()) {
             cleanup();
@@ -918,6 +953,7 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
      * Use this to implement polling behavior for server-initiated notifications.
      */
     closeStandaloneSSEStream(): void {
+        this._clearKeepAliveTimer();
         const stream = this._streamMapping.get(this._standaloneSseStreamId);
         if (stream) {
             stream.cleanup();
